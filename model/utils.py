@@ -1,4 +1,5 @@
 import torch
+from torchvision.ops import box_convert
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 from scipy.optimize import linear_sum_assignment
@@ -98,13 +99,11 @@ def query_aligned_loss(pred_coarse_logits:torch.Tensor, fine_labels:torch.Tensor
             total_loss += loss
 
             total_assignments.append((b, queries_mask, assignments))
-            
+
     return total_loss
 
 def post_process_detr_outputs(image_processor:DetrImageProcessor, detr_outputs, target_sizes, threshold:float=0.25):
-    # target_sizes (`torch.Tensor` or `list[tuple[int, int]]`):
-    # length == batch_size
-    
+
     processed_outputs = image_processor.post_process_object_detection(
         detr_outputs, target_sizes=target_sizes, threshold=threshold
     )
@@ -112,21 +111,18 @@ def post_process_detr_outputs(image_processor:DetrImageProcessor, detr_outputs, 
     return processed_outputs
 
 def convert_detr_targets(targets):
-    
+
+    #TODO, replace the logic with 
     converted_targets = []
     for t in targets:
         size = t["orig_size"].tolist()  # (H, W)
         h, w = size
 
-        boxes = t["boxes"]  # (N, 4) in normalized xywh
-        x_min = boxes[:, 0] * w
-        y_min = boxes[:, 1] * h
-        x_max = (boxes[:, 0] + boxes[:, 2]) * w
-        y_max = (boxes[:, 1] + boxes[:, 3]) * h
-        boxes_abs = torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+        boxes_abs = t["boxes"] * torch.tensor([w, h, w, h], device=t["boxes"].device)
+        boxes_xyxy = box_convert(boxes=boxes_abs, in_fmt="cxcywh", out_fmt="xyxy")
 
         converted_targets.append({
-            "boxes": boxes_abs.cpu(),
+            "boxes": boxes_xyxy.cpu(),
             "labels": t["class_labels"].cpu()
         })
 
@@ -135,14 +131,11 @@ def convert_detr_targets(targets):
 def compute_detr_metrics(metric:MeanAveragePrecision, predictions, targets):
 
     targets = convert_detr_targets(targets)
-
     for idx, preds in enumerate(predictions):
         predictions[idx] = {
             "boxes": preds["boxes"].cpu(),
             "scores": preds["scores"].cpu(),
             "labels": preds["labels"].cpu()
         }
-        
-    metric.update(predictions, targets)
 
-    
+    metric.update(predictions, targets)
