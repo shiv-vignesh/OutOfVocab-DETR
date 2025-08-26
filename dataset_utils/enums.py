@@ -84,9 +84,9 @@ class Enums:
         "vehicle": 0,
         "cycle": 1,
         "pedestrian": 2,
-        "barrier": 3,
-        "traffic_cone": 4,
-        "movable_object": 5,
+        # "barrier": 3,
+        # "traffic_cone": 4,
+        # "movable_object": 5,
         # "static_object": 6,
         # "animal": 7
     }
@@ -95,9 +95,9 @@ class Enums:
         0: "vehicle",
         1: "cycle",
         2: "pedestrian",
-        3: "barrier",
-        4: "traffic_cone",
-        5: "movable_object",
+        # 3: "barrier",
+        # 4: "traffic_cone",
+        # 5: "movable_object",
         # 6: "static_object",
         # 7: "animal"
     }
