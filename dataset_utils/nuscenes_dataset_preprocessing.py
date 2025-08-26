@@ -1,5 +1,6 @@
 import os
 import json
+from collections import defaultdict
 from typing import List, Dict, Iterable
 
 import numpy as np
@@ -14,6 +15,7 @@ import transformers
 from transformers import BertTokenizer, ViTImageProcessor, AutoTokenizer, DetrImageProcessor
 
 from .enums import Enums
+from .data_augmentation import MosaicAugmentation
 
 class NuScenesObjectDetectDataset(Dataset):    
     
@@ -89,10 +91,16 @@ class NuScenesDETRPreprocessing:
             self.text_tokenizer = None
 
         if self.apply_augmentation:
-            self.transform = albumentations.Compose([
+            self.transformation = albumentations.Compose([
                 albumentations.RandomBrightnessContrast(p=0.5),
                 albumentations.HorizontalFlip(p=0.5),
-                albumentations.LongestMaxSize(max_size=max(self.image_resize)),
+                albumentations.RandomResizedCrop(
+                    size=(self.resized_height, self.resized_width),
+                    scale=(0.5, 1.0),   # don’t crop below 50% of image
+                    ratio=(0.8, 1.25),  # allow mild aspect ratio jitter
+                    p=0.5
+                ),
+                albumentations.LongestMaxSize(max_size=max(self.image_resize)), # redundant with RandomResizedCrop.
                 albumentations.PadIfNeeded(
                     min_height=self.resized_height,
                     min_width=self.resized_width,
@@ -129,7 +137,8 @@ class NuScenesDETRPreprocessing:
         
         for label_data in labels_2d_cam_front:
             attribute = label_data['category_name']
-            if attribute in Enums.NUSCENES_TO_GENERAL_CLASSES:
+            visibility = label_data['visibility_token']
+            if attribute in Enums.NUSCENES_TO_GENERAL_CLASSES and visibility in ["3", "4"]:
                 if Enums.NUSCENES_TO_GENERAL_CLASSES[attribute] not in Enums.nuscenes_label2Id:
                     continue
                 
@@ -170,6 +179,7 @@ class NuScenesDETRPreprocessing:
             labels_2d_cam_front = data['labels_2d_cam_front']            
 
             image = cv2.imread(cam_front_fp)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
             class_labels, fine_labels, fine_labels_str, bboxes_2d = self.preprocess_labels(labels_2d_cam_front)
 
@@ -255,10 +265,103 @@ class NuScenesDETRPreprocessing:
             "fine_labels":batch_fine_labels
         }
 
+class NuScenesDETRAugPreprocessing(NuScenesDETRPreprocessing):
+    
+    def __init__(self, image_resize = (800, 800), original_size = (900, 1600), 
+                apply_augmentation=False, tokenize_fine_labels = True, eval_mode = False):
+        super().__init__(image_resize, original_size, apply_augmentation, tokenize_fine_labels, eval_mode)
+        
+        self.mosaic_augmentation = MosaicAugmentation(
+            self.resized_width, self.resized_height
+        )
+            
+    def __call__(self, batch):
+        
+        augmentation_data_items = defaultdict(lambda:defaultdict())
+        
+        images = []
+        annotations = []
+        batch_fine_labels = []
+        batch_fine_labels_str = []
+
+        for idx, data in enumerate(batch):
+            cam_front_fp = data['cam_front_fp']
+            labels_2d_cam_front = data['labels_2d_cam_front']
+
+            image = cv2.imread(cam_front_fp)
+            # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            class_labels, fine_labels, fine_labels_str, bboxes_2d = self.preprocess_labels(labels_2d_cam_front)
+
+            transformed_dict = self.transform_sample(
+                image, bboxes_2d, class_labels
+            )                        
+
+            if (idx + 1) % 4 == 0:
+                augmentation_data_items[idx] = {
+                    "image":transformed_dict["image"],
+                    "bboxes_2d": transformed_dict['bboxes'],
+                    "class_labels": transformed_dict['class_labels'],
+                    "cam_front_fp":cam_front_fp
+                }
+                mosaic_image, quadrant_bboxes, quadrant_labels = self.mosaic_augmentation(augmentation_data_items, 
+                                                                                        use_random_quadrant_dimensions=False)
+                coco_boxes = []
+                for bbox, label in zip(quadrant_bboxes, quadrant_labels):
+                    x_min, y_min, x_max, y_max = bbox
+                    w = x_max - x_min
+                    h = y_max - y_min
+
+                    coco_boxes.append({
+                        "bbox": [
+                            x_min,
+                            y_min,
+                            w, 
+                            h
+                        ],
+                        "category_id": int(label),
+                        "area": w*h
+                    })
+
+                annotations.append({
+                    "image_id": idx,
+                    "annotations": coco_boxes
+                })
+                images.append(mosaic_image)
+
+                augmentation_data_items = defaultdict(lambda:defaultdict())
+
+            else:
+                augmentation_data_items[idx] = {
+                    "image":transformed_dict["image"],
+                    "bboxes_2d": transformed_dict['bboxes'],
+                    "class_labels": transformed_dict['class_labels'],
+                    "cam_front_fp":cam_front_fp
+                }
+                
+        encoding = self.image_preprocessor(
+            images=images,
+            annotations=annotations,
+            return_tensors="pt"
+        )
+        
+        coarse_labels = encoding['labels']
+        pixel_values = encoding['pixel_values']
+        encoding = self.image_preprocessor.pad(pixel_values, return_tensors="pt")
+
+        pixel_mask = encoding.pixel_mask
+        pixel_values = encoding.pixel_values
+        
+        return {
+            "pixel_values":pixel_values,
+            "pixel_mask":pixel_mask,
+            "coarse_labels":coarse_labels
+        }
+
 if __name__ == "__main__":
     dataset =NuScenesObjectDetectDataset(
-        table_blob_paths=['../trainval01_blobs/tables.json'],
-        root_dir='../'
+        table_blob_paths=['../data/trainval01_blobs_US/tables.json'],
+        root_dir='../data/'
     )
 
     from torch.utils.data import DataLoader
@@ -266,8 +369,11 @@ if __name__ == "__main__":
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=4,
-        collate_fn=NuScenesDETRPreprocessing()
+        # collate_fn=NuScenesDETRPreprocessing()
+        collate_fn=NuScenesDETRAugPreprocessing(),
+        shuffle=True
     )
 
     for data in dataloader:
+        print(data["labels"])
         exit(1)
